@@ -1,0 +1,192 @@
+name: Build installers
+
+# Builds Zap-Database's installers here, on a PUBLIC repository, where GitHub's
+# standard runners are free. On the private source repo the same work bills at
+# Linux 1x / Windows 2x / macOS 10x — about 43 minutes for one three-platform
+# build, of which macOS is 30.
+#
+# WHAT MUST NOT HAPPEN HERE: publishing source. A failing `tsc` or `vitest`
+# prints a code frame — several lines of real source around the failure — and
+# the logs of a public repository are readable by anyone, forever. So the split
+# is deliberate:
+#
+#   private repo -> typecheck and tests (cheap on Linux, output stays private)
+#   this repo    -> packaging only (electron-builder prints paths, not source)
+#
+# Packaging still runs `tsc` and `vite` as part of `npm run build`, so that one
+# step has its output withheld on failure. electron-builder's own output is
+# shown, because it describes toolchain and config problems rather than code.
+#
+# The token here is READ-ONLY on the source repo. Everything this workflow
+# publishes goes to a release in *this* repo, using the automatic GITHUB_TOKEN,
+# so a compromise of this workflow cannot write to the private repository.
+on:
+  repository_dispatch:
+    types: [build]
+  # `workflow_dispatch` on a public repo is restricted to users with write
+  # access. `pull_request_target` is deliberately absent — it would hand secrets
+  # to code from a fork.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit, branch or tag in zap-database"
+        default: master
+      platforms:
+        description: "Installers to build"
+        type: choice
+        default: all
+        options: [all, windows, linux, macos]
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: JeremiePineau/zap-database
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      ref: ${{ steps.pick.outputs.ref }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          want="${{ github.event.inputs.platforms || github.event.client_payload.platforms || 'all' }}"
+          ref="${{ github.event.inputs.ref || github.event.client_payload.ref || 'master' }}"
+
+          linux='{"os":"ubuntu-latest","artifact":"linux"}'
+          windows='{"os":"windows-latest","artifact":"windows"}'
+          macos='{"os":"macos-latest","artifact":"macos"}'
+          case "$want" in
+            windows) matrix="[$windows]" ;;
+            linux)   matrix="[$linux]" ;;
+            macos)   matrix="[$macos]" ;;
+            *)       matrix="[$linux,$windows,$macos]" ;;
+          esac
+          echo "building $want from $ref"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      # The source is private; SOURCE_TOKEN needs Contents: Read on it and
+      # nothing else. It is never printed, and the checkout lives only on the
+      # ephemeral runner.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # Compile with output withheld on failure. `tsc` and `vite` both print
+      # source on error, and the private repo has already typechecked this exact
+      # commit — a failure here is nearly always a platform-specific path or
+      # toolchain problem, reproducible privately.
+      - name: Compile (output withheld — see the note above)
+        shell: bash
+        run: |
+          if ! npm run build > compile.log 2>&1; then
+            echo "::error::compile failed on the public runner. Output is withheld \
+          because tsc and vite print source, and this repository's logs are public. \
+          Re-run the private repo's `check` job on this commit to see the error."
+            # File names alone are safe and usually enough to locate the problem.
+            grep -oE '[A-Za-z0-9_./-]+\.(ts|tsx)' compile.log | sort -u | head -20 || true
+            exit 1
+          fi
+          echo "compiled cleanly"
+
+      # electron-builder's output describes packaging, not code, so it is shown.
+      - name: Package
+        run: npx electron-builder --publish never
+
+      # The `files` whitelist in electron-builder.yml is what keeps the
+      # gitignored .env — which holds a live database password — out of a
+      # release. Checked here too: an artifact that leaks it would be public.
+      - name: Fail if a secret got packaged
+        shell: bash
+        run: |
+          if ls release/.env* >/dev/null 2>&1; then
+            echo "::error::a .env file was packaged"; exit 1
+          fi
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          case "${{ matrix.artifact }}" in
+            windows) assets=(release/*.exe release/*.exe.blockmap release/latest.yml) ;;
+            macos)   assets=(release/*.dmg) ;;
+            linux)   assets=(release/*.AppImage release/*.deb) ;;
+          esac
+
+          # Windows self-updates from this release, so its metadata must be here
+          # or the feed silently never offers anything.
+          if [ "${{ matrix.artifact }}" = "windows" ] && [ ! -f release/latest.yml ]; then
+            echo "::error::latest.yml missing — electron-builder did not emit update metadata"
+            exit 1
+          fi
+
+          gh release view latest >/dev/null 2>&1 || \
+            gh release create latest --title "Latest build" --prerelease=false \
+              --notes "Installers for Zap-Database. This tag moves with every build."
+
+          echo "publishing: ${assets[*]}"
+          gh release upload latest "${assets[@]}" --clobber
+
+          # Prune this platform's assets under any other name — --clobber only
+          # replaces same-named files, so a rename would leave the old one.
+          keep=$(printf '%s\n' "${assets[@]}" | xargs -n1 basename)
+          case "${{ matrix.artifact }}" in
+            windows) mine='\.(exe|exe\.blockmap)$|^latest\.yml$' ;;
+            macos)   mine='\.dmg$' ;;
+            linux)   mine='\.(AppImage|deb)$' ;;
+          esac
+          gh release view latest --json assets -q '.assets[].name' | while read -r have; do
+            [ -n "$have" ] || continue
+            if grep -qE "$mine" <<<"$have" && ! grep -qxF "$have" <<<"$keep"; then
+              echo "removing stale asset: $have"
+              gh release delete-asset latest "$have" --yes || true
+            fi
+          done
+
+      # The check that catches a broken feed: fetch it anonymously, as a client
+      # does, and resolve the file it names. Both feed defects this project has
+      # had were invisible to everything except this.
+      - name: Verify the published feed resolves
+        if: matrix.artifact == 'windows'
+        shell: bash
+        run: |
+          set -uo pipefail
+          base="https://github.com/${{ github.repository }}/releases/download/latest"
+          if ! curl -sfL "$base/latest.yml" -o latest.yml; then
+            echo "::error::latest.yml is not anonymously readable at $base"; exit 1
+          fi
+          cat latest.yml
+          expected=$(node -p "require('./package.json').version")
+          published=$(grep -E '^version:' latest.yml | awk '{print $2}' | tr -d "'\"")
+          [ "$published" = "$expected" ] || {
+            echo "::error::feed advertises $published but this build is $expected"; exit 1; }
+          file=$(grep -E '^path:' latest.yml | sed -E "s/^path: *//; s/^['\"]//; s/['\"]$//")
+          code=$(curl -s -o /dev/null -w '%{http_code}' -L "$base/$file")
+          [ "$code" = "200" ] || {
+            echo "::error::the feed names '$file' but it returns HTTP $code — latest.yml and the \
+          uploaded asset name disagree; check nsis.artifactName for spaces"; exit 1; }
+          echo "feed verified: $expected -> $file (HTTP 200)"
