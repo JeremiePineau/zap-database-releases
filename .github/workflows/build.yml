@@ -129,6 +129,11 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          # `gh` infers the repository from the checked-out git remote, and the
+          # workspace holds the PRIVATE source repo — so every `gh release` call
+          # here silently targeted `zap-database` and 404'd, because
+          # GITHUB_TOKEN is scoped to this repository. Every call is explicit.
+          THIS_REPO: ${{ github.repository }}
         run: |
           set -uo pipefail
           case "${{ matrix.artifact }}" in
@@ -144,12 +149,12 @@ jobs:
             exit 1
           fi
 
-          gh release view latest >/dev/null 2>&1 || \
-            gh release create latest --title "Latest build" --prerelease=false \
+          gh release view latest -R "$THIS_REPO" >/dev/null 2>&1 || \
+            gh release create latest -R "$THIS_REPO" --title "Latest build" --prerelease=false \
               --notes "Installers for Zap-Database. This tag moves with every build."
 
           echo "publishing: ${assets[*]}"
-          gh release upload latest "${assets[@]}" --clobber
+          gh release upload latest -R "$THIS_REPO" "${assets[@]}" --clobber
 
           # Prune this platform's assets under any other name — --clobber only
           # replaces same-named files, so a rename would leave the old one.
@@ -159,11 +164,11 @@ jobs:
             macos)   mine='\.dmg$' ;;
             linux)   mine='\.(AppImage|deb)$' ;;
           esac
-          gh release view latest --json assets -q '.assets[].name' | while read -r have; do
+          gh release view latest -R "$THIS_REPO" --json assets -q '.assets[].name' | while read -r have; do
             [ -n "$have" ] || continue
             if grep -qE "$mine" <<<"$have" && ! grep -qxF "$have" <<<"$keep"; then
               echo "removing stale asset: $have"
-              gh release delete-asset latest "$have" --yes || true
+              gh release delete-asset latest "$have" -R "$THIS_REPO" --yes || true
             fi
           done
 
